@@ -38,9 +38,21 @@ packages = ["urosim"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["urosim/client/generated"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+# Generated protobuf/gRPC stubs use dynamic attribute loading that mypy
+# cannot see statically. Exclude them from the source set and treat
+# imports from that package as Any.
+exclude = ["urosim/client/generated/"]
+
+[[tool.mypy.overrides]]
+module = ["urosim.client.generated.*"]
+follow_imports = "skip"
+ignore_errors = true

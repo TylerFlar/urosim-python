@@ -1,2 +1,203 @@
 syntax = "proto3";
 package urosim;
+
+// ---------------------------------------------------------------------------
+// Core primitives
+// ---------------------------------------------------------------------------
+
+message Empty {}
+
+message Status {
+  bool   success = 1;
+  string message = 2;
+}
+
+// Rigid-body pose. Position in mm; rotation as unit quaternion (x, y, z, w).
+message Pose {
+  float x  = 1;
+  float y  = 2;
+  float z  = 3;
+  float qx = 4;
+  float qy = 5;
+  float qz = 6;
+  float qw = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Scope I/O
+// ---------------------------------------------------------------------------
+
+// Command sent to the scope per step.
+message ScopeCommand {
+  float advance_mm   = 1;  // Translation along the scope insertion axis (mm).
+  float roll_deg     = 2;  // Rotation about the scope axis (degrees).
+  float kappa        = 3;  // Tip curvature magnitude (1/mm).
+  float phi          = 4;  // Tip curvature direction (radians).
+  bool  laser_active = 5;  // Fire the holmium laser this step.
+}
+
+// Low-level scope telemetry reported by the sim.
+message Telemetry {
+  float advance_position_mm = 1;
+  float roll_position_deg   = 2;
+  float kappa_actual_deg    = 3;
+  float phi_actual_deg      = 4;
+  float tip_contact_force_N = 5;
+  bool  laser_active        = 6;
+  bool  perforation         = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Coverage / stones
+// ---------------------------------------------------------------------------
+
+message CoverageState {
+  repeated string     visited_calyx_ids     = 1;
+  int32               total_calyces         = 2;
+  float               coverage_fraction     = 3;
+  map<string, float>  calyx_observation_pct = 4;
+}
+
+message StoneState {
+  int32  index          = 1;
+  Pose   pose           = 2;
+  float  hp_fraction    = 3;
+  string composition    = 4;
+  bool   fragmented     = 5;
+  int32  fragment_count = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Step / observation
+// ---------------------------------------------------------------------------
+
+message StepResult {
+  Pose                tip_pose_gt       = 1;
+  Pose                tip_pose_reported = 2;
+  Telemetry           telemetry         = 3;
+  CoverageState       coverage          = 4;
+  repeated StoneState stones            = 5;
+  double              timestamp         = 6;
+  int64               frame_number      = 7;
+  bytes               rgb_jpeg          = 8;  // Fallback image (used when no Unity streaming RGB).
+}
+
+// Schema-identical to StepResult; returned by Reset to provide an initial
+// observation without a preceding command.
+message Observation {
+  Pose                tip_pose_gt       = 1;
+  Pose                tip_pose_reported = 2;
+  Telemetry           telemetry         = 3;
+  CoverageState       coverage          = 4;
+  repeated StoneState stones            = 5;
+  double              timestamp         = 6;
+  int64               frame_number      = 7;
+  bytes               rgb_jpeg          = 8;
+}
+
+message ResetRequest {
+  int64  seed           = 1;
+  string config_preset  = 2;
+  string fidelity       = 3;
+  string camera_profile = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Anatomy upload
+// ---------------------------------------------------------------------------
+
+// A single stone to place when loading a kidney. Only the xyz components of
+// ``position`` are meaningful; the quaternion fields are ignored.
+message StoneSpec {
+  Pose   position    = 1;
+  float  radius_mm   = 2;
+  string composition = 3;
+  float  hp          = 4;
+}
+
+// Full kidney payload uploaded to Unity via LoadKidney.
+//
+// Binary array layouts:
+//   normals_bin        : float32, shape (V, 3), C-contiguous. Unit-length.
+//   texture_coords_bin : float32, shape (V, 3), C-contiguous.
+// V must match the vertex count of ``mesh_obj``.
+//
+// JSON layouts:
+//   graph_json           : networkx node-link data (directed), numpy positions
+//                          converted to lists (see _graph_to_jsonable).
+//   coverage_points_json : {calyx_id: [[x,y,z], ...], ...}
+message KidneyData {
+  bytes              mesh_obj             = 1;  // Wavefront OBJ as UTF-8 bytes.
+  bytes              normals_bin          = 2;
+  bytes              graph_json           = 3;
+  repeated StoneSpec stones               = 4;
+  Pose               ureter_entry         = 5;  // xyz only.
+  bytes              texture_coords_bin   = 6;
+  bytes              coverage_points_json = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Topology introspection
+// ---------------------------------------------------------------------------
+
+message CalyxInfo {
+  string id        = 1;
+  Pose   center    = 2;
+  float  radius_mm = 3;
+  string type      = 4;  // "pelvis" | "major_calyx" | "minor_calyx"
+}
+
+message TopologyGraph {
+  bytes              graph_json = 1;
+  repeated CalyxInfo calyces    = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Config / visual / recording
+// ---------------------------------------------------------------------------
+
+message SimConfig {
+  float dt                = 1;
+  bool  dynamics_enabled  = 2;
+}
+
+message VisualParams {
+  float tissue_hue_offset       = 1;
+  float tissue_saturation_scale = 2;
+  float light_intensity_scale   = 3;
+  float light_temperature_K     = 4;
+  float turbidity               = 5;
+  float vein_density_scale      = 6;
+}
+
+message RecordingConfig {
+  string output_dir        = 1;
+  bool   save_rgb          = 2;
+  bool   save_depth        = 3;
+  bool   save_flow         = 4;
+  bool   save_instance_seg = 5;
+  int32  image_width       = 6;
+  int32  image_height      = 7;
+  string pose_format       = 8;
+}
+
+message RecordingResult {
+  string output_dir       = 1;
+  int64  frames_recorded  = 2;
+  double duration_seconds = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+service UroSim {
+  rpc Reset            (ResetRequest)    returns (Observation);
+  rpc Step             (ScopeCommand)    returns (StepResult);
+  rpc LoadKidney       (KidneyData)      returns (Status);
+  rpc GetTopologyGraph (Empty)           returns (TopologyGraph);
+  rpc SetConfig        (SimConfig)       returns (Status);
+  rpc SetVisualParams  (VisualParams)    returns (Status);
+  rpc StartRecording   (RecordingConfig) returns (Status);
+  rpc StopRecording    (Empty)           returns (RecordingResult);
+}
