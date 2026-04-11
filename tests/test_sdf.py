@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import numpy as np
 
+from urosim.anatomy.centerlines import generate_centerlines
+from urosim.anatomy.placement import place_nodes_3d
 from urosim.anatomy.sdf import (
     capsule_sdf,
     ellipsoid_sdf,
+    kidney_sdf,
     perlin_noise_3d,
     sdf_gradient,
     smooth_min,
     sphere_sdf,
 )
+from urosim.anatomy.topology import build_topology
 
 SEED = 12345
 N_BATCH = 1000
@@ -298,3 +302,126 @@ def test_sdf_gradient_batched_shape_and_unit_length() -> None:
     assert grads.shape == (N_BATCH, 3)
     assert np.all(np.isfinite(grads))
     assert np.allclose(np.linalg.norm(grads, axis=1), 1.0, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# kidney_sdf
+# ---------------------------------------------------------------------------
+
+_PELVIS_RADII: tuple[float, float, float] = (20.0, 15.0, 10.0)
+
+
+def _build_sample_kidney(
+    pelvis_type: str = "A2", seed: int = SEED
+) -> tuple[object, dict]:
+    """Deterministically build a small kidney fixture for SDF tests."""
+    rng = np.random.default_rng(seed)
+    graph = build_topology(pelvis_type, rng)
+    place_nodes_3d(graph, rng)
+    centerlines = generate_centerlines(graph, rng)
+    return graph, centerlines
+
+
+def test_kidney_sdf_shape_and_finite() -> None:
+    graph, centerlines = _build_sample_kidney()
+    rng = _rng()
+    pts = rng.uniform(-80.0, 80.0, size=(N_BATCH, 3))
+    d = kidney_sdf(pts, graph, centerlines, _PELVIS_RADII)
+    assert d.shape == (N_BATCH,)
+    assert np.all(np.isfinite(d))
+
+
+def test_kidney_sdf_has_inside_and_outside() -> None:
+    graph, centerlines = _build_sample_kidney()
+    rng = _rng()
+    # Box that straddles the kidney bounding ellipsoid (55, 25, 15).
+    pts = rng.uniform(
+        low=[-70.0, -35.0, -25.0],
+        high=[70.0, 35.0, 25.0],
+        size=(2000, 3),
+    )
+    d = kidney_sdf(pts, graph, centerlines, _PELVIS_RADII)
+    assert np.any(d < 0.0), "expected some points inside the kidney"
+    assert np.any(d > 0.0), "expected some points outside the kidney"
+
+
+def test_kidney_sdf_pelvis_center_inside() -> None:
+    graph, centerlines = _build_sample_kidney()
+    pelvis_pos = next(
+        np.asarray(attrs["position"], dtype=np.float64)
+        for _, attrs in graph.nodes(data=True)
+        if attrs.get("type") == "pelvis"
+    )
+    d = kidney_sdf(pelvis_pos[None, :], graph, centerlines, _PELVIS_RADII)
+    assert d.shape == (1,)
+    assert d[0] < 0.0
+
+
+def test_kidney_sdf_minor_calyx_centers_inside() -> None:
+    graph, centerlines = _build_sample_kidney()
+    minor_pts = np.array(
+        [
+            graph.nodes[n]["position"]
+            for n, attrs in graph.nodes(data=True)
+            if attrs.get("type") == "minor_calyx"
+        ],
+        dtype=np.float64,
+    )
+    assert minor_pts.shape[0] > 0
+    d = kidney_sdf(minor_pts, graph, centerlines, _PELVIS_RADII)
+    assert d.shape == (minor_pts.shape[0],)
+    assert np.all(d < 0.0), f"minor calyx centers not inside: {d}"
+
+
+def test_kidney_sdf_far_point_outside() -> None:
+    graph, centerlines = _build_sample_kidney()
+    far = np.array([[200.0, 200.0, 200.0]])
+    d = kidney_sdf(far, graph, centerlines, _PELVIS_RADII)
+    assert d[0] > 0.0
+
+
+def test_kidney_sdf_centerline_midpoints_inside() -> None:
+    graph, centerlines = _build_sample_kidney()
+    midpoints: list[np.ndarray] = []
+    for line in centerlines.values():
+        line_arr = np.asarray(line, dtype=np.float64)
+        # Sample midpoints of a handful of consecutive sample pairs,
+        # spread across the edge.
+        n_seg = line_arr.shape[0] - 1
+        idxs = np.unique(np.linspace(0, n_seg - 1, num=5).astype(int))
+        for i in idxs:
+            midpoints.append(0.5 * (line_arr[i] + line_arr[i + 1]))
+    mid_pts = np.stack(midpoints, axis=0)
+    d = kidney_sdf(mid_pts, graph, centerlines, _PELVIS_RADII)
+    assert np.all(d < 0.0), (
+        f"centerline segment midpoints not inside (max={d.max():.3f} mm)"
+    )
+
+
+def test_kidney_sdf_smoothness() -> None:
+    graph, centerlines = _build_sample_kidney()
+    rng = _rng()
+    # Sample points in a tight box around the kidney so perturbations
+    # exercise the interesting (near-surface) regions of the field.
+    pts = rng.uniform(
+        low=[-60.0, -30.0, -20.0],
+        high=[60.0, 30.0, 20.0],
+        size=(50, 3),
+    )
+    delta = np.array([0.1, 0.0, 0.0])
+    d0 = kidney_sdf(pts, graph, centerlines, _PELVIS_RADII)
+    d1 = kidney_sdf(pts + delta, graph, centerlines, _PELVIS_RADII)
+    diffs = np.abs(d1 - d0)
+    assert np.all(diffs < 2.0), (
+        f"kidney_sdf not smooth: max |Δ| = {diffs.max():.3f} mm for a 0.1 mm step"
+    )
+
+
+def test_kidney_sdf_deterministic() -> None:
+    graph_a, centerlines_a = _build_sample_kidney()
+    graph_b, centerlines_b = _build_sample_kidney()
+    rng = _rng()
+    pts = rng.uniform(-50.0, 50.0, size=(500, 3))
+    d_a = kidney_sdf(pts, graph_a, centerlines_a, _PELVIS_RADII)
+    d_b = kidney_sdf(pts, graph_b, centerlines_b, _PELVIS_RADII)
+    assert np.array_equal(d_a, d_b)

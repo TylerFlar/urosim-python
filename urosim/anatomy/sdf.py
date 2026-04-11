@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import networkx as nx
 import numpy as np
 
 # Guard against division by zero when normalizing gradients or
@@ -224,6 +225,116 @@ def perlin_noise_3d(
 
     # Normalize from [0, 1] into [-1, 1].
     return 2.0 * (total / max_amp) - 1.0
+
+
+def kidney_sdf(
+    points: np.ndarray,
+    graph: nx.DiGraph,
+    centerlines: dict[tuple[str, str], np.ndarray],
+    pelvis_radii: tuple[float, float, float],
+) -> np.ndarray:
+    """Composite signed distance field for a kidney collecting system.
+
+    Walks a collecting-system topology graph and blends together the
+    constituent primitives into a single field suitable for marching
+    cubes extraction or collision queries:
+
+    * the renal pelvis as an axis-aligned ellipsoid centered on the
+      pelvis node,
+    * each infundibular edge as a chain of constant-radius
+      :func:`capsule_sdf` segments traced along its centerline, with
+      radius ``width_mm / 2`` from the edge attribute,
+    * each minor calyx as a :func:`sphere_sdf` cup at the node position
+      with radius derived from the incoming edge width (clamped to the
+      4-6 mm clinical range), and
+    * additive Perlin mucosal surface detail at two frequencies.
+
+    All component SDFs are combined via :func:`smooth_min` with
+    ``k = 3.0`` mm so branch junctions and cup-tube transitions round
+    into one another smoothly.
+
+    Because the Perlin detail is *added* to the combined SDF rather
+    than blended into it, the returned array is a valid level set
+    (zero on the surface) but not a strict signed distance function
+    — its gradient magnitude is no longer exactly 1 near the
+    isosurface. That is sufficient for marching cubes and for the
+    "near/far" queries nav/ needs; it is **not** sufficient for sphere
+    tracing that assumes unit-Lipschitz behaviour. The noise
+    amplitudes (0.3 mm at scale 2, 0.1 mm at scale 8) are tuned so
+    the overall field has a worst-case Lipschitz constant of roughly
+    10 mm/mm — increase them cautiously.
+
+    Reduction order is pinned via sorted iteration over edges and
+    nodes so the output is independent of Python dict ordering;
+    ``smooth_min`` is not associative, so this matters for
+    reproducibility.
+
+    Args:
+        points: Query points with shape ``(N, 3)`` in mm.
+        graph: Collecting-system graph. Nodes must carry ``"position"``
+            (``numpy.ndarray`` of shape ``(3,)``) and ``"type"``
+            (``"pelvis"``, ``"major_calyx"``, or ``"minor_calyx"``).
+            Edges must carry ``"width_mm"`` (float).
+        centerlines: Mapping from each edge ``(u, v)`` to its sampled
+            centerline as a ``(M, 3)`` array, typically produced by
+            :func:`urosim.anatomy.centerlines.generate_centerlines`.
+        pelvis_radii: Ellipsoid half-axes ``(a, b, c)`` in mm for the
+            renal pelvis.
+
+    Returns:
+        ``(N,)`` array of level-set values. Negative inside the
+        collecting system, approximately zero on the mucosal surface,
+        positive outside.
+
+    Raises:
+        ValueError: If ``graph`` contains no node with
+            ``type == "pelvis"``.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    half_axes = np.asarray(pelvis_radii, dtype=np.float64).reshape(3)
+
+    k_smooth = 3.0
+
+    # 1. Seed with the pelvis ellipsoid.
+    pelvis_node: str | None = None
+    for node, attrs in graph.nodes(data=True):
+        if attrs.get("type") == "pelvis":
+            pelvis_node = node
+            break
+    if pelvis_node is None:
+        raise ValueError("graph has no pelvis node")
+
+    pelvis_pos = np.asarray(
+        graph.nodes[pelvis_node]["position"], dtype=np.float64
+    )
+    base = ellipsoid_sdf(pts, pelvis_pos, half_axes)
+
+    # 2. Infundibulum capsule chains — sorted for deterministic reduction.
+    for (u, v), line in sorted(centerlines.items()):
+        width = float(graph.edges[u, v]["width_mm"])
+        r = 0.5 * width
+        line_arr = np.asarray(line, dtype=np.float64)
+        for i in range(line_arr.shape[0] - 1):
+            seg = capsule_sdf(pts, line_arr[i], line_arr[i + 1], r, r)
+            base = smooth_min(base, seg, k_smooth)
+
+    # 3. Minor calyx cups — also sorted for deterministic reduction.
+    for node, attrs in sorted(graph.nodes(data=True), key=lambda item: item[0]):
+        if attrs.get("type") != "minor_calyx":
+            continue
+        pos = np.asarray(attrs["position"], dtype=np.float64)
+        preds = list(graph.predecessors(node))
+        if preds:
+            parent_width = float(graph.edges[preds[0], node]["width_mm"])
+            cup_r = float(np.clip(0.5 * parent_width, 4.0, 6.0))
+        else:
+            cup_r = 5.0
+        base = smooth_min(base, sphere_sdf(pts, pos, cup_r), k_smooth)
+
+    # 4. Additive Perlin mucosal surface detail.
+    detail = 0.3 * perlin_noise_3d(pts, scale=2.0)
+    detail = detail + 0.1 * perlin_noise_3d(pts, scale=8.0)
+    return base + detail
 
 
 def _value_noise_3d(pts: np.ndarray) -> np.ndarray:
