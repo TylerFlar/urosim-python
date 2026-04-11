@@ -16,53 +16,7 @@ import trimesh
 
 from urosim.anatomy.mesh_extract import extract_kidney_mesh
 
-_FAST_VOXEL_SIZE: float = 1.0
-_FAST_TARGET_EDGE: float = 2.0
 _DEFAULT_SEED: int = 12345
-
-
-@pytest.fixture(scope="session")
-def kidney_mesh_fast(
-    pelvis_radii: tuple[float, float, float],
-) -> trimesh.Trimesh:
-    """Session-scoped kidney mesh extracted at a coarse resolution.
-
-    Reused across the fast-tier tests so the expensive SDF evaluation
-    and remeshing pipeline only runs once per pytest session.
-    """
-    # Rebuild the sample kidney inline — session-scoped fixtures cannot
-    # depend on the function-scoped ``sample_kidney`` fixture.
-    from urosim.anatomy.centerlines import generate_centerlines
-    from urosim.anatomy.placement import place_nodes_3d
-    from urosim.anatomy.topology import build_topology
-
-    rng = np.random.default_rng(_DEFAULT_SEED)
-    graph = build_topology("A2", rng)
-    place_nodes_3d(graph, rng)
-    centerlines = generate_centerlines(graph, rng)
-    return extract_kidney_mesh(
-        graph,
-        centerlines,
-        pelvis_radii,
-        voxel_size=_FAST_VOXEL_SIZE,
-        target_edge_length=_FAST_TARGET_EDGE,
-    )
-
-
-@pytest.fixture(scope="session")
-def sample_kidney_graph_fast(
-    pelvis_radii: tuple[float, float, float],
-) -> tuple[object, dict]:
-    """Session-scoped (graph, centerlines) matching ``kidney_mesh_fast``."""
-    from urosim.anatomy.centerlines import generate_centerlines
-    from urosim.anatomy.placement import place_nodes_3d
-    from urosim.anatomy.topology import build_topology
-
-    rng = np.random.default_rng(_DEFAULT_SEED)
-    graph = build_topology("A2", rng)
-    place_nodes_3d(graph, rng)
-    centerlines = generate_centerlines(graph, rng)
-    return graph, centerlines
 
 
 def test_returns_trimesh(kidney_mesh_fast: trimesh.Trimesh) -> None:
